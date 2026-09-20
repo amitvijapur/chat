@@ -8,7 +8,7 @@ import {
   threadIdContract,
 } from "@chat-adapter/tests";
 import type { IStreamer } from "@microsoft/teams.apps";
-import { ConsoleLogger, getEmoji } from "chat";
+import { type ChatInstance, ConsoleLogger, getEmoji } from "chat";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { TeamsActivityAttachment } from "./attachments";
 import { createTeamsAdapter, TeamsAdapter, type TeamsThreadId } from "./index";
@@ -372,6 +372,36 @@ describe("TeamsAdapter", () => {
       });
       expect(adapter.name).toBe("teams");
     });
+  });
+
+  it("preserves the empty dialog response when an action rejects", async () => {
+    class DialogAdapter extends TeamsAdapter {
+      open(chat: ChatInstance) {
+        this.chat = chat;
+        return this.handleDialogOpen({
+          activity: {
+            type: "invoke",
+            name: "task/fetch",
+            id: "activity",
+            serviceUrl: TEST_SERVICE_URL,
+            from: { id: "user", name: "User" },
+            conversation: { id: "conversation", conversationType: "personal" },
+            value: { data: { actionId: "review" } },
+          },
+        } as Parameters<typeof this.handleDialogOpen>[0]);
+      }
+    }
+    const adapter = new DialogAdapter({
+      appId: "test-app",
+      appPassword: "test",
+      logger,
+    });
+    const chat = createMockChatInstance({
+      overrides: {
+        processAction: vi.fn().mockRejectedValue(new Error("Admission failed")),
+      },
+    });
+    await expect(adapter.open(chat)).resolves.toBeUndefined();
   });
 
   describe("streaming", () => {
@@ -1419,6 +1449,137 @@ describe("TeamsAdapter", () => {
 
       await expect(
         adapter.deleteMessage(threadId, "del-msg-1")
+      ).resolves.not.toThrow();
+      expect(mockDelete).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe("targeted message mutation", () => {
+    /**
+     * Teams accepts an update or a delete for a targeted activity only through
+     * the `?isTargetedActivity=true` endpoint variant, so the adapter has to
+     * remember which activities it sent targeted.
+     */
+    async function createTargetedAdapter() {
+      const adapter = createTeamsAdapter({
+        appId: "test-app-id",
+        appPassword: "test",
+        logger,
+      });
+      await adapter.initialize(createMockChatInstance());
+
+      const calls = {
+        update: vi.fn(async () => ({ id: "targeted-msg-1" })),
+        updateTargeted: vi.fn(async () => ({ id: "targeted-msg-1" })),
+        delete: vi.fn(async () => undefined),
+        deleteTargeted: vi.fn(async () => undefined),
+      };
+      const mockApp = (
+        adapter as unknown as { app: { api: unknown; sendTo: unknown } }
+      ).app;
+      mockApp.sendTo = vi.fn(async () => ({
+        id: "targeted-msg-1",
+        type: "message",
+      }));
+      mockApp.api = {
+        conversations: { activities: () => calls },
+        reactions: { add: vi.fn(), remove: vi.fn() },
+        serviceUrl: "https://smba.trafficmanager.net/teams/",
+      };
+
+      const threadId = adapter.encodeThreadId({
+        conversationId: "19:abc@thread.tacv2",
+        serviceUrl: "https://smba.trafficmanager.net/teams/",
+      });
+
+      return { adapter, calls, threadId };
+    }
+
+    it("deletes a message it sent targeted through the targeted endpoint", async () => {
+      const { adapter, calls, threadId } = await createTargetedAdapter();
+      await adapter.postEphemeral(threadId, "29:target-user", {
+        markdown: "Only you can see this",
+      });
+
+      await adapter.deleteMessage(threadId, "targeted-msg-1");
+
+      expect(calls.deleteTargeted).toHaveBeenCalledWith("targeted-msg-1");
+      expect(calls.delete).not.toHaveBeenCalled();
+    });
+
+    it("edits a message it sent targeted through the targeted endpoint", async () => {
+      const { adapter, calls, threadId } = await createTargetedAdapter();
+      await adapter.postEphemeral(threadId, "29:target-user", {
+        markdown: "Only you can see this",
+      });
+
+      await adapter.editMessage(threadId, "targeted-msg-1", {
+        markdown: "Updated",
+      });
+
+      expect(calls.updateTargeted).toHaveBeenCalledTimes(1);
+      expect(calls.update).not.toHaveBeenCalled();
+    });
+
+    it("leaves a message it did not send targeted on the plain endpoint", async () => {
+      const { adapter, calls, threadId } = await createTargetedAdapter();
+
+      await adapter.deleteMessage(threadId, "public-msg-1");
+      await adapter.editMessage(threadId, "public-msg-1", {
+        markdown: "Updated",
+      });
+
+      expect(calls.delete).toHaveBeenCalledWith("public-msg-1");
+      expect(calls.update).toHaveBeenCalledTimes(1);
+      expect(calls.deleteTargeted).not.toHaveBeenCalled();
+      expect(calls.updateTargeted).not.toHaveBeenCalled();
+    });
+
+    it("stops treating a targeted message as targeted once it is deleted", async () => {
+      const { adapter, calls, threadId } = await createTargetedAdapter();
+      await adapter.postEphemeral(threadId, "29:target-user", {
+        markdown: "Only you can see this",
+      });
+
+      await adapter.deleteMessage(threadId, "targeted-msg-1");
+      await adapter.deleteMessage(threadId, "targeted-msg-1");
+
+      expect(calls.deleteTargeted).toHaveBeenCalledTimes(1);
+      expect(calls.delete).toHaveBeenCalledTimes(1);
+    });
+
+    it("falls back to the plain endpoint when the state adapter cannot be read", async () => {
+      const state = createMockState();
+      const adapter = createTeamsAdapter({
+        appId: "test-app-id",
+        appPassword: "test",
+        logger,
+      });
+      await adapter.initialize(createMockChatInstance({ state }));
+      state.get = vi.fn().mockRejectedValue(new Error("state unavailable"));
+
+      const mockDelete = vi.fn(async () => undefined);
+      const mockApp = (adapter as unknown as { app: { api: unknown } }).app;
+      mockApp.api = {
+        conversations: {
+          activities: () => ({
+            delete: mockDelete,
+            deleteTargeted: vi.fn(),
+            update: vi.fn(),
+            updateTargeted: vi.fn(),
+          }),
+        },
+        reactions: { add: vi.fn(), remove: vi.fn() },
+        serviceUrl: "https://smba.trafficmanager.net/teams/",
+      };
+
+      const threadId = adapter.encodeThreadId({
+        conversationId: "19:abc@thread.tacv2",
+        serviceUrl: "https://smba.trafficmanager.net/teams/",
+      });
+
+      await expect(
+        adapter.deleteMessage(threadId, "msg-1")
       ).resolves.not.toThrow();
       expect(mockDelete).toHaveBeenCalledTimes(1);
     });

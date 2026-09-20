@@ -196,6 +196,7 @@ export interface ChatConfig<
  * Options for webhook handling.
  */
 export interface WebhookOptions {
+  deduplicate?: boolean;
   /**
    * Override the default modal-opening behavior to handle it inline
    * within the current webhook response cycle.
@@ -209,6 +210,14 @@ export interface WebhookOptions {
     modal: ModalElement,
     contextId: string
   ) => Promise<{ viewId: string } | undefined>;
+  /**
+   * Opt in to exposing message, action, and slash command handler errors
+   * through `waitUntil`.
+   * This only changes handler-error observability through `waitUntil`; errors
+   * are still logged and direct method behavior is unchanged.
+   * Defaults to `false`, preserving the current fulfilled-task behavior.
+   */
+  propagateHandlerErrors?: boolean;
   /**
    * Function to run message handling in the background.
    * Use this to ensure fast webhook responses while processing continues.
@@ -497,7 +506,7 @@ export interface Adapter<TThreadId = unknown, TRawMessage = unknown> {
   ): Promise<RawMessage<TRawMessage>>;
 
   /**
-   * Post an ephemeral message visible only to a specific user.
+   * Post a message visible only to a specific user, natively or via an explicit fallback.
    *
    * This is optional - if not implemented, Thread.postEphemeral will
    * fall back to openDM + postMessage when fallbackToDM is true.
@@ -505,13 +514,14 @@ export interface Adapter<TThreadId = unknown, TRawMessage = unknown> {
    * @param threadId - The thread to post in
    * @param userId - The user who should see the message
    * @param message - The message content
-   * @returns EphemeralMessage with usedFallback: false
+   * @returns EphemeralMessage with usedFallback indicating private delivery, or null if unsupported
    */
   postEphemeral?(
     threadId: string,
     userId: string,
-    message: AdapterPostableMessage
-  ): Promise<EphemeralMessage<TRawMessage>>;
+    message: AdapterPostableMessage,
+    options?: PostEphemeralOptions
+  ): Promise<EphemeralMessage<TRawMessage> | null>;
 
   /** Post a message to a thread */
   postMessage(
@@ -862,7 +872,7 @@ export interface ChatInstance {
   processReaction(
     event: Omit<ReactionEvent, "adapter" | "thread"> & { adapter?: Adapter },
     options?: WebhookOptions
-  ): void;
+  ): Promise<void> | void;
 
   /**
    * Process an incoming slash command from an adapter.
@@ -877,7 +887,7 @@ export interface ChatInstance {
       channelId: string;
     },
     options: WebhookOptions | undefined
-  ): void;
+  ): Promise<void> | void;
 
   /** Optional so custom ChatInstance implementations predating it keep compiling. */
   processUninstalled?(event: UninstalledEvent, options?: WebhookOptions): void;
@@ -1782,7 +1792,7 @@ export type AdapterPostableMessage =
  * - `{ card: CardElement }` - Rich card with buttons (Block Kit / Adaptive Cards / GChat Cards)
  * - `CardElement` - Direct card element
  * - `AsyncIterable<string>` - Streaming text (e.g., from AI SDK's textStream)
- * - `AsyncIterable<string | StreamEvent>` - AI SDK fullStream (auto-detected, extracts text with step separators)
+ * - `AsyncIterable<string | StreamEvent>` - AI SDK fullStream or TanStack AI `chat()` stream (auto-detected, extracts text with step separators)
  */
 export type PostableMessage =
   | AdapterPostableMessage
@@ -1790,14 +1800,18 @@ export type PostableMessage =
   | PostableObject;
 
 /**
- * Duck-typed stream event compatible with AI SDK's `fullStream`.
- * - `text-delta` events are extracted as text output.
- * - `finish-step` events trigger paragraph separators between steps.
- * - All other event types (tool-call, tool-result, etc.) are silently skipped.
+ * Duck-typed stream event compatible with AI SDK's `fullStream` and with
+ * AG-UI protocol streams such as TanStack AI's `chat()`.
+ * - `text-delta` (AI SDK) and `TEXT_MESSAGE_CONTENT` (AG-UI) events are extracted as text output.
+ * - `finish-step` (AI SDK) and `TEXT_MESSAGE_END` (AG-UI) events trigger paragraph separators between steps.
+ * - All other event types (tool calls, tool results, run lifecycle, reasoning, etc.) are silently skipped.
  */
 export type StreamEvent =
   | { textDelta: string; type: "text-delta" }
+  | { text: string; type: "text-delta" }
   | { type: "finish-step" }
+  | { delta: string; messageId: string; type: "TEXT_MESSAGE_CONTENT" }
+  | { messageId: string; type: "TEXT_MESSAGE_END" }
   | { type: string };
 
 export interface PostableRaw {

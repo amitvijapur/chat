@@ -497,17 +497,27 @@ export class Chat<
       return;
     }
 
-    // Avoid concurrent initialization
+    // Avoid concurrent initialization. A failed state connection is forgotten so the
+    // next caller retries once the dependency (e.g. Redis) has recovered,
+    // instead of every later webhook rejecting with the first error (#922).
     if (!this.initPromise) {
-      this.initPromise = this.doInitialize();
+      this.logger.info("Initializing chat instance...");
+      const attempt = this._stateAdapter
+        .connect()
+        .catch((error: unknown) => {
+          if (this.initPromise === attempt) {
+            this.initPromise = null;
+          }
+          throw error;
+        })
+        .then(() => this.doInitialize());
+      this.initPromise = attempt;
     }
 
     await this.initPromise;
   }
 
   private async doInitialize(): Promise<void> {
-    this.logger.info("Initializing chat instance...");
-    await this._stateAdapter.connect();
     this.logger.debug("State connected");
 
     const initPromises = Array.from(this.adapters.values()).map(
@@ -1054,19 +1064,24 @@ export class Chat<
         typeof messageOrFactory === "function"
           ? await messageOrFactory()
           : messageOrFactory;
-      await this.handleIncomingMessage(adapter, threadId, message);
+      if (options?.deduplicate === false) {
+        await runInConversation(threadId, () =>
+          this.routeIncomingMessage(adapter, threadId, message, false)
+        );
+      } else {
+        await this.handleIncomingMessage(adapter, threadId, message);
+      }
     })();
 
-    // Track via waitUntil with errors swallowed (existing webhook semantics —
-    // platforms shouldn't retry on handler bugs). The returned task itself
-    // still rejects so streaming adapters (e.g. @chat-adapter/web) can
-    // surface failures to the client.
+    // Keep existing fulfilled waitUntil semantics by default while logging.
+    // The returned task itself still rejects so streaming adapters (e.g.
+    // @chat-adapter/web) can surface failures to the client.
     const tracked = task.catch((err) => {
       this.logger.error("Message processing error", { error: err, threadId });
     });
 
     if (options?.waitUntil) {
-      options.waitUntil(tracked);
+      options.waitUntil(options.propagateHandlerErrors ? task : tracked);
     }
 
     return task;
@@ -1151,10 +1166,11 @@ export class Chat<
   processReaction(
     event: Omit<ReactionEvent, "adapter" | "thread"> & { adapter?: Adapter },
     options?: WebhookOptions
-  ): void {
+  ): Promise<void> {
     const task = runInConversation(event.threadId, () =>
       this.handleReactionEvent(event)
-    ).catch((err) => {
+    );
+    const tracked = task.catch((err) => {
       this.logger.error("Reaction processing error", {
         error: err,
         emoji: event.emoji,
@@ -1163,8 +1179,9 @@ export class Chat<
     });
 
     if (options?.waitUntil) {
-      options.waitUntil(task);
+      options.waitUntil(tracked);
     }
+    return task;
   }
 
   /**
@@ -1177,7 +1194,8 @@ export class Chat<
   ): Promise<void> {
     const task = runInConversation(event.threadId, () =>
       this.handleActionEvent(event, options)
-    ).catch((err) => {
+    );
+    const tracked = task.catch((err) => {
       this.logger.error("Action processing error", {
         error: err,
         actionId: event.actionId,
@@ -1186,7 +1204,7 @@ export class Chat<
     });
 
     if (options?.waitUntil) {
-      options.waitUntil(task);
+      options.waitUntil(options.propagateHandlerErrors ? task : tracked);
     }
 
     return task;
@@ -1346,8 +1364,9 @@ export class Chat<
       channelId: string;
     },
     options: WebhookOptions | undefined
-  ): void {
-    const task = this.handleSlashCommandEvent(event, options).catch((err) => {
+  ): Promise<void> {
+    const task = this.handleSlashCommandEvent(event, options);
+    const tracked = task.catch((err) => {
       this.logger.error("Slash command processing error", {
         error: err,
         command: event.command,
@@ -1356,8 +1375,9 @@ export class Chat<
     });
 
     if (options?.waitUntil) {
-      options.waitUntil(task);
+      options.waitUntil(options.propagateHandlerErrors ? task : tracked);
     }
+    return task;
   }
 
   processAssistantThreadStarted(
@@ -2342,7 +2362,8 @@ export class Chat<
   private async routeIncomingMessage(
     adapter: Adapter,
     threadId: string,
-    message: Message
+    message: Message,
+    deduplicate = true
   ): Promise<void> {
     setMessageAdapter(message, adapter);
 
@@ -2364,6 +2385,11 @@ export class Chat<
       return;
     }
 
+    if (!deduplicate) {
+      await this.dispatchIncomingMessage(adapter, threadId, message);
+      return;
+    }
+
     // Deduplicate messages atomically - same message can arrive via multiple paths
     // (e.g., Slack message + app_mention events, GChat direct webhook + Pub/Sub)
     const dedupeKey = `dedupe:${adapter.name}:${message.id}`;
@@ -2380,6 +2406,14 @@ export class Chat<
       return;
     }
 
+    await this.dispatchIncomingMessage(adapter, threadId, message);
+  }
+
+  private async dispatchIncomingMessage(
+    adapter: Adapter,
+    threadId: string,
+    message: Message
+  ): Promise<void> {
     // Persist incoming message BEFORE acquiring the lock.
     // If the lock is already held (e.g., bot is processing a previous message),
     // we still want to save this message to history so it's not lost.
@@ -3168,7 +3202,9 @@ export class Chat<
       return;
     }
 
-    // Backward compat: treat DMs as mentions when no DM handlers registered
+    // Backward compat: treat DMs as mentions when no DM handlers registered.
+    // This is a routing rule, not a detection result, so it deliberately
+    // overrides an adapter's `false`: every DM is addressed to the bot.
     if (isDM) {
       message.isMention = true;
     }
@@ -3235,13 +3271,17 @@ export class Chat<
     message: Message,
     context?: MessageContext
   ): boolean {
+    // An adapter that reads the platform's own mention metadata reports a
+    // definitive boolean. Fall back to text detection only when it reports
+    // nothing, so a known non-mention is not re-derived from flattened text
+    // (where code samples and quoted text can look like a mention).
     message.isMention =
-      message.isMention || this.detectMention(adapter, message);
+      message.isMention ?? this.detectMention(adapter, message);
 
     let hasMention = message.isMention === true;
     for (const skipped of context?.skipped ?? []) {
       skipped.isMention =
-        skipped.isMention || this.detectMention(adapter, skipped);
+        skipped.isMention ?? this.detectMention(adapter, skipped);
       hasMention = hasMention || skipped.isMention === true;
     }
 

@@ -233,6 +233,7 @@ export class LinearAdapter
   }
 
   protected readonly mode: LinearAdapterMode;
+  private shouldRecommendAgentSessions: boolean;
   protected readonly webhookSecret?: string;
   protected readonly webhookVerifier?: LinearWebhookVerifier;
   // Vercel Connect access-token resolver (Connect mode only)
@@ -277,6 +278,10 @@ export class LinearAdapter
     this.webhookVerifier = webhookVerifier;
     this.logger = config.logger ?? new ConsoleLogger("info").child("linear");
     this.mode = config.mode ?? "comments";
+    this.shouldRecommendAgentSessions =
+      config.mode === undefined &&
+      typeof config.accessToken === "function" &&
+      Boolean(webhookVerifier);
     this.userName =
       config.userName ?? process.env.LINEAR_BOT_USERNAME ?? "linear-bot";
     this.apiUrl = config.apiUrl ?? process.env.LINEAR_API_URL;
@@ -384,6 +389,13 @@ export class LinearAdapter
 
   async initialize(chat: ChatInstance): Promise<void> {
     this.chat = chat;
+
+    if (this.shouldRecommendAgentSessions) {
+      this.shouldRecommendAgentSessions = false;
+      this.logger.info(
+        'Agent sessions are recommended for Linear bots. Set mode: "agent-sessions" to enable them.'
+      );
+    }
 
     // For client credentials mode, fetch an access token first
     if (this.clientCredentials) {
@@ -2372,7 +2384,9 @@ export class LinearAdapter
 
     return new Message<LinearRawMessage>({
       id: raw.comment.id,
-      isMention: raw.kind === "agent_session_comment", // Agent session comments are treated as mentions as they directly target the bot
+      // Agent session comments directly target the bot. Ordinary comments are
+      // left undetermined so the SDK can still detect an @mention in the body.
+      isMention: raw.kind === "agent_session_comment" ? true : undefined,
       threadId:
         raw.kind === "agent_session_comment"
           ? this.encodeThreadId({

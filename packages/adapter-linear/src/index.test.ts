@@ -678,6 +678,37 @@ describe("parseMessage", () => {
     expect(message.author.userId).toBe("user-456");
     expect(message.raw.kind).toBe("agent_session_comment");
   });
+
+  it("should mark an agent session comment as a mention", () => {
+    const adapter = createTestAdapter("agent-sessions");
+    const raw = {
+      kind: "agent_session_comment" as const,
+      organizationId: "org-123",
+      agentSessionId: "session-123",
+      comment: {
+        ...createRawCommentMessage({ body: "Hello" }).comment,
+      },
+    };
+
+    const message = adapter.parseMessage(raw);
+
+    expect(message.isMention).toBe(true);
+  });
+
+  it("should leave isMention undetermined for an ordinary comment", () => {
+    const adapter = createTestAdapter();
+    const raw = createRawCommentMessage({
+      id: "comment-mention",
+      body: "Hey @testbot could you take a look?",
+      issueId: "issue-1",
+      user: { id: "user-1" },
+    });
+
+    const message = adapter.parseMessage(raw);
+
+    // Undetermined so the SDK still detects the @mention in the comment body.
+    expect(message.isMention).toBeUndefined();
+  });
 });
 
 // =============================================================================
@@ -986,13 +1017,128 @@ connectWebhookContract({
 });
 
 describe("Vercel Connect mode", () => {
-  it("verifies via webhookVerifier and dispatches comment events", async () => {
+  it.each([
+    { mode: undefined, resolver: true, verifier: true, recommends: true },
+    { mode: "comments", resolver: true, verifier: true, recommends: false },
+    {
+      mode: "agent-sessions",
+      resolver: true,
+      verifier: true,
+      recommends: false,
+    },
+    { mode: undefined, resolver: false, verifier: true, recommends: false },
+    { mode: undefined, resolver: true, verifier: false, recommends: false },
+    { mode: undefined, resolver: false, verifier: false, recommends: false },
+  ] as const)("recommends agent sessions only once for implicit Connect mode: %j", async ({
+    mode,
+    resolver,
+    verifier,
+    recommends,
+  }) => {
+    const logger = createMockLogger();
+    const adapter = createLinearAdapter({
+      accessToken: resolver
+        ? () => Promise.resolve("connect-token")
+        : "static-token",
+      ...(verifier
+        ? { webhookVerifier: () => true }
+        : { webhookSecret: "secret" }),
+      mode,
+      logger,
+    });
+    vi.spyOn(
+      adapter as unknown as { resolveConnectIdentity: () => Promise<void> },
+      "resolveConnectIdentity"
+    ).mockResolvedValue(undefined);
+    const recommendation =
+      'Agent sessions are recommended for Linear bots. Set mode: "agent-sessions" to enable them.';
+    expect(logger.info).not.toHaveBeenCalledWith(recommendation);
+    const chat = createMockChatInstance({ state: createMockState(), logger });
+    await Promise.all([adapter.initialize(chat), adapter.initialize(chat)]);
+    await adapter.initialize(chat);
+    expect(
+      logger.info.mock.calls.filter(([message]) => message === recommendation)
+    ).toHaveLength(recommends ? 1 : 0);
+  });
+
+  it.each([
+    undefined,
+    "agent-sessions",
+    "comments",
+  ] as const)("routes Connect webhooks with mode %s", async (mode) => {
+    const logger = createMockLogger();
+    const verifier = vi.fn(() => true);
+    const adapter = createLinearAdapter({
+      accessToken: () => Promise.resolve("connect-token"),
+      webhookVerifier: verifier,
+      ...(mode ? { mode } : {}),
+      logger,
+    });
+    setBotUserId(adapter, "bot-user-id");
+    setDefaultOrganizationId(adapter, "org-123");
+    const chat = createMockChatInstance({ state: createMockState(), logger });
+    (adapter as unknown as { chat: typeof chat }).chat = chat;
+
+    for (const payload of [
+      createCommentPayload(),
+      createAgentSessionPayload(),
+    ]) {
+      const response = await adapter.handleWebhook(
+        buildWebhookRequest(JSON.stringify(payload))
+      );
+      expect(response.status).toBe(200);
+    }
+
+    expect(verifier).toHaveBeenCalledTimes(2);
+    expect(chat.processMessage).toHaveBeenCalledOnce();
+    const message = chat.processMessage.mock.calls[0][2];
+    expect(message.threadId).toBe(
+      mode === "agent-sessions"
+        ? "linear:issue-123:s:agent-session-1"
+        : "linear:issue-123:c:comment-abc"
+    );
+  });
+
+  it.each([
+    { accessToken: "static-token" },
+    { apiKey: "api-key" },
+  ])("keeps comments as the default with a custom verifier and static credentials %j", async (auth) => {
+    const logger = createMockLogger();
+    const adapter = createLinearAdapter({
+      ...auth,
+      webhookVerifier: () => true,
+      logger,
+    });
+    setBotUserId(adapter, "bot-user-id");
+    setDefaultOrganizationId(adapter, "org-123");
+    const chat = createMockChatInstance({ state: createMockState(), logger });
+    (adapter as unknown as { chat: typeof chat }).chat = chat;
+
+    for (const payload of [
+      createCommentPayload(),
+      createAgentSessionPayload(),
+    ]) {
+      expect(
+        (
+          await adapter.handleWebhook(
+            buildWebhookRequest(JSON.stringify(payload))
+          )
+        ).status
+      ).toBe(200);
+    }
+    expect(chat.processMessage).toHaveBeenCalledOnce();
+    expect(chat.processMessage.mock.calls[0][2].threadId).toBe(
+      "linear:issue-123:c:comment-abc"
+    );
+  });
+  it("verifies via webhookVerifier and dispatches explicitly enabled comment events", async () => {
     const logger = createMockLogger();
     const verifier = vi.fn(() => true);
     const resolver = vi.fn(() => Promise.resolve("lin_connect_token"));
     const adapter = new LinearAdapter({
       accessToken: resolver,
       webhookVerifier: verifier,
+      mode: "comments",
       userName: "test-bot",
       logger,
     });

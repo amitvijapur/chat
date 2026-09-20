@@ -157,7 +157,7 @@ describe("Gateway client configuration", () => {
     await listenerPromise;
   });
 
-  it("forwards the wire packet when discord.js patches it during the channel lookup", async () => {
+  it("forwards the wire packet when discord.js patches it after the raw listener returns", async () => {
     mockClientInstance.on.mockClear();
     const fetchMock = vi
       .fn()
@@ -195,17 +195,18 @@ describe("Gateway client configuration", () => {
       },
     };
 
-    // Stands in for discord.js, which patches the same object in place while
-    // this handler is parked (`Message.js`: `Object.assign(data.member, { user })`).
-    mockClientInstance.channels.fetch.mockImplementation(async () => {
-      Object.assign(packet.d.member, { user: { id: "u1", username: "bob" } });
-      return { isThread: () => false };
+    mockClientInstance.channels.fetch.mockResolvedValue({
+      isThread: () => false,
     });
 
     const rawHandler = mockClientInstance.on.mock.calls.find(
       ([event]) => event === "raw"
     )?.[1] as (packet: { t: string; d: unknown }) => Promise<void>;
-    await rawHandler(packet);
+    const forwarded = rawHandler(packet);
+    // Stands in for discord.js, which handles the packet as soon as the `raw`
+    // listeners return (`Message.js`: `Object.assign(data.member, { user })`).
+    Object.assign(packet.d.member, { user: { id: "u1", username: "bob" } });
+    await forwarded;
 
     const request = fetchMock.mock.calls[0]?.[1] as RequestInit;
     expect(JSON.parse(request.body as string).data).toEqual({
