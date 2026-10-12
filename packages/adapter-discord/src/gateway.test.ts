@@ -157,7 +157,14 @@ describe("Gateway client configuration", () => {
     await listenerPromise;
   });
 
-  it("forwards the wire packet when discord.js patches it after the raw listener returns", async () => {
+  it.each([
+    { channel: "channel456", thread: false, cyclic: false },
+    { channel: "unregistered999", thread: false, cyclic: false },
+    { channel: "thread789", thread: true, cyclic: false },
+    { channel: "channel456", thread: false, cyclic: true },
+    { channel: "unregistered999", thread: false, cyclic: true },
+    { channel: "thread789", thread: true, cyclic: true },
+  ])("snapshots $channel before mutation (cyclic: $cyclic)", async (scenario) => {
     mockClientInstance.on.mockClear();
     const fetchMock = vi
       .fn()
@@ -189,14 +196,16 @@ describe("Gateway client configuration", () => {
     const packet = {
       t: "MESSAGE_CREATE",
       d: {
-        channel_id: "unregistered999",
+        channel_id: scenario.channel,
         author: { bot: false },
         member: {} as Record<string, unknown>,
       },
     };
 
     mockClientInstance.channels.fetch.mockResolvedValue({
-      isThread: () => false,
+      id: scenario.channel,
+      parentId: "channel456",
+      isThread: () => scenario.thread,
     });
 
     const rawHandler = mockClientInstance.on.mock.calls.find(
@@ -206,13 +215,19 @@ describe("Gateway client configuration", () => {
     // Stands in for discord.js, which handles the packet as soon as the `raw`
     // listeners return (`Message.js`: `Object.assign(data.member, { user })`).
     Object.assign(packet.d.member, { user: { id: "u1", username: "bob" } });
+    if (scenario.cyclic) {
+      packet.d.member.user = packet.d;
+    }
     await forwarded;
 
     const request = fetchMock.mock.calls[0]?.[1] as RequestInit;
     expect(JSON.parse(request.body as string).data).toEqual({
-      channel_id: "unregistered999",
+      channel_id: scenario.channel,
       author: { bot: false },
       member: {},
+      ...(scenario.thread
+        ? { thread: { id: scenario.channel, parent_id: "channel456" } }
+        : {}),
     });
 
     controller.abort();
